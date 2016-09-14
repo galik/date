@@ -196,6 +196,12 @@ expand_path(std::string path)
 
 #endif  // !_WIN32
 
+#ifdef DATE_USE_LINUX_TZ
+#include <arpa/inet.h> // ntohl
+#include <cstring>
+#include <cerrno>
+#endif
+
 namespace date
 {
 // +---------------------+
@@ -2885,6 +2891,305 @@ get_tzdb()
     return ref;
 }
 
+#ifdef DATE_USE_LINUX_TZ
+// http://man7.org/linux/man-pages/man5/tzfile.5.html
+
+#define bug_var(v) do{std::cout << #v ": " << v << '\n';}while(0)
+
+const std::string tz_location_dir = "/usr/share/zoneinfo";
+
+using netw_long = std::int32_t;
+using host_long = std::int32_t;
+
+/// read a network byte ordered long 32bit int
+std::istream& binary_read_netlong(std::istream& is, netw_long& n)
+{
+	typename std::make_unsigned<netw_long>::type u;
+	is.read((char*)&u, sizeof(u));
+	n = ntohl(u);
+	return is;
+}
+
+template<std::size_t N>
+std::istream& binary_read_char_array(std::istream& is, char(&t)[N])
+{
+	return is.read(t, N);
+}
+
+struct tzfile_header
+{
+// *  The magic four-byte sequence "TZif" identifying this as a timezone
+//	information file.
+	char TZif[4];
+//
+// *  A single character identifying the version of the file's format:
+//	either an ASCII NUL ('\0') or a '2' (0x32).
+	char version; // '\0' || '2'
+
+// *  Fifteen bytes containing zeros reserved for future use.
+	char reserved[15];
+
+// *  Six four-byte values of type long, written in a "standard" byte
+//	order (the high-order byte of the value is written first).  These
+//	values are, in order:
+//
+//	tzh_ttisgmtcnt
+//		   The number of UTC/local indicators stored in the file.
+	host_long tzh_ttisgmtcnt;
+
+//
+//	tzh_ttisstdcnt
+//		   The number of standard/wall indicators stored in the file.
+	host_long tzh_ttisstdcnt;
+
+//
+//	tzh_leapcnt
+//		   The number of leap seconds for which data is stored in the
+//		   file.
+	host_long tzh_leapcnt;
+
+//
+//	tzh_timecnt
+//		   The number of "transition times" for which data is stored
+//		   in the file.
+	host_long tzh_timecnt;
+
+//
+//	tzh_typecnt
+//		   The number of "local time types" for which data is stored
+//		   in the file (must not be zero).
+	host_long tzh_typecnt;
+
+//
+//	tzh_charcnt
+//		   The number of characters of "timezone abbreviation strings"
+//		   stored in the file.
+	host_long tzh_charcnt;
+
+	friend std::istream& operator>>(std::istream& is, tzfile_header& tzh)
+	{
+		binary_read_char_array(is, tzh.TZif);
+		is.get(tzh.version);
+		binary_read_char_array(is, tzh.reserved);
+		binary_read_netlong(is, tzh.tzh_ttisgmtcnt);
+		binary_read_netlong(is, tzh.tzh_ttisstdcnt);
+		binary_read_netlong(is, tzh.tzh_leapcnt);
+		binary_read_netlong(is, tzh.tzh_timecnt);
+		binary_read_netlong(is, tzh.tzh_typecnt);
+		binary_read_netlong(is, tzh.tzh_charcnt);
+
+		return is;
+	}
+
+	friend std::ostream& operator<<(std::ostream& os, const tzfile_header& tzh)
+	{
+		os << "TZiF: " << std::string(tzh.TZif, sizeof(tzh.TZif)) << '\n';
+		os << "version: " << tzh.version << '\n';
+		os << "reserved: " << std::string(tzh.reserved, sizeof(tzh.reserved)) << '\n';
+		os << "tzh_ttisgmtcnt: " << tzh.tzh_ttisgmtcnt << '\n';
+		os << "tzh_ttisstdcnt: " << tzh.tzh_ttisstdcnt << '\n';
+		os << "tzh_leapcnt: " << tzh.tzh_leapcnt << '\n';
+		os << "tzh_timecnt: " << tzh.tzh_timecnt << '\n';
+		os << "tzh_typecnt: " << tzh.tzh_typecnt << '\n';
+		os << "tzh_charcnt: " << tzh.tzh_charcnt << '\n';
+		return os;
+	}
+};
+
+struct ttinfo
+{
+	//	Each structure is written as a four-byte value for tt_gmtoff of type
+	//	long, in a standard byte order, followed by a one-byte value for
+	//	tt_isdst and a one-byte value for tt_abbrind.  In each structure,
+	//	tt_gmtoff gives the number of seconds to be added to UTC, tt_isdst
+	//	tells whether tm_isdst should be set by localtime(3), and tt_abbrind
+	//	serves as an index into the array of timezone abbreviation characters
+	//	that follow the ttinfo structure(s) in the file.
+
+	long tt_gmtoff;
+	int tt_isdst;
+	unsigned int tt_abbrind;
+
+	friend std::istream& operator>>(std::istream& is, ttinfo& tt)
+	{
+		netw_long n;
+		unsigned char c;
+		binary_read_netlong(is, n);
+		tt.tt_gmtoff = n;
+		is.read((char*)&c, 1);
+		tt.tt_isdst = c;
+		is.read((char*)&c, 1);
+		tt.tt_abbrind = c;
+		return is;
+	}
+};
+
+struct ttleap
+{
+	std::time_t when;
+	host_long count;
+
+	friend std::istream& operator>>(std::istream& is, ttleap& ttl)
+	{
+		netw_long n;
+		binary_read_netlong(is, n);
+		ttl.when = n;
+		binary_read_netlong(is, n);
+		ttl.count = n;
+	}
+};
+
+bool read_system_zoneinfo(TZ_DB& db, const std::string& tz_name)
+{
+	if(auto ifs = std::ifstream(tz_location_dir + '/' + tz_name, std::ios::binary))
+	{
+		tzfile_header tzh;
+		if(!(ifs >> tzh))
+			throw std::runtime_error(std::strerror(errno));
+
+		if(std::strncmp(tzh.TZif, "TZif", 4))
+		{
+			bug_var(std::string(tzh.TZif, 4));
+			throw std::runtime_error("bad zoneinfo file header detected for: " + tz_name);
+		}
+
+		struct transition
+		{
+			std::time_t when;
+			char type;
+		};
+
+		//   The above header is followed by tzh_timecnt four-byte values of type
+		//   long, sorted in ascending order.  These values are written in
+		//   "standard" byte order.  Each is used as a transition time (as
+		//   returned by time(2)) at which the rules for computing local time
+		//   change.
+
+		std::vector<transition> transitions(tzh.tzh_timecnt);
+		for(auto& trans: transitions)
+		{
+			netw_long n;
+			binary_read_netlong(ifs, n);
+			trans.when = n;
+		}
+
+		//   Next come tzh_timecnt one-byte values of type unsigned char;
+		//   each one tells which of the different types of "local time" types
+		//   described in the file is associated with the same-indexed transition
+		//   time.
+
+		for(auto& trans: transitions)
+			ifs.get(trans.type);
+
+		//   These values serve as indices into an array of ttinfo
+		//   structures (with tzh_typecnt entries) that appear next in the file;
+		//   these structures are defined as follows:
+
+		std::vector<ttinfo> ttinfos(tzh.tzh_typecnt);
+
+		for(auto& tt: ttinfos)
+			ifs >> tt;
+
+		// abbreviation strings
+		std::string abbrvs(tzh.tzh_charcnt, '\0');
+		ifs.read(&abbrvs[0], abbrvs.size());
+
+		std::vector<ttleap> ttleaps(tzh.tzh_leapcnt);
+		for(auto& leap: ttleaps)
+			ifs >> leap;
+
+		// standard or wall time time? chars
+		std::string stdorwalls(tzh.tzh_ttisstdcnt, '\0');
+		ifs.read(&stdorwalls[0], stdorwalls.size());
+
+		// DEBUG - display record
+
+		std::cout << "tz_header:" << '\n';
+		std::cout << tzh <<'\n';
+
+		std::cout << "transitions:" << '\n';
+		for(auto const& trans: transitions)
+			std::cout << int(trans.type) << ": " << std::ctime(&trans.when);
+
+		std::cout << "ttinfos:" << '\n';
+		for(auto const& tt: ttinfos)
+		{
+			std::cout << "tt_gmtoff : " << tt.tt_gmtoff << '\n';
+			std::cout << "tt_isdst  : " << std::boolalpha << bool(tt.tt_isdst) << '\n';
+			std::cout << "tt_abbrind: " << tt.tt_abbrind
+			<< ": " << std::string(abbrvs.data() + tt.tt_abbrind) << '\n';
+		}
+
+		std::cout << "leap seconds:" << '\n';
+		for(auto const& leap: ttleaps)
+			std::cout << leap.count << ": " << std::ctime(&leap.when);
+
+		std::cout << "standard or wall time?:" << '\n';
+		for(auto c: stdorwalls)
+			std::cout << std::boolalpha << bool(c) << '\n';
+
+	}
+	else
+	{
+		throw std::runtime_error(std::strerror(errno));
+	}
+
+	return false;
+}
+
+bool try_to_locate_zone(TZ_DB& db, const std::string& tz_name, const time_zone*& zi_ref)
+{
+    auto zi = std::lower_bound(db.zones.begin(), db.zones.end(), tz_name,
+        [](const time_zone& z, const std::string& nm)
+        {
+            return z.name() < nm;
+        });
+    if (zi == db.zones.end() || zi->name() != tz_name)
+    {
+        auto li = std::lower_bound(db.links.begin(), db.links.end(), tz_name,
+        [](const link& z, const std::string& nm)
+        {
+            return z.name() < nm;
+        });
+        if (li != db.links.end() && li->name() == tz_name)
+        {
+            zi = std::lower_bound(db.zones.begin(), db.zones.end(), li->target(),
+                [](const time_zone& z, const std::string& nm)
+                {
+                    return z.name() < nm;
+                });
+            if (zi != db.zones.end() && zi->name() == li->target())
+            {
+                zi_ref = &*zi;
+                return true;
+            }
+        }
+        return false;
+    }
+    zi_ref = &*zi;
+    return true;
+}
+
+const time_zone*
+locate_zone(const std::string& tz_name)
+{
+	bug_var(tz_name);
+
+	static TZ_DB db;
+
+	const time_zone* tz_ref = nullptr;
+
+	if(!try_to_locate_zone(db, tz_name, tz_ref))
+		read_system_zoneinfo(db, tz_name); // try to cache it
+
+	if(!try_to_locate_zone(db, tz_name, tz_ref))
+		throw std::runtime_error(tz_name + " not found in timezone database");
+
+    return tz_ref;
+}
+
+#else
+
 const time_zone*
 locate_zone(const std::string& tz_name)
 {
@@ -2915,6 +3220,8 @@ locate_zone(const std::string& tz_name)
     }
     return &*zi;
 }
+
+#endif
 
 std::ostream&
 operator<<(std::ostream& os, const TZ_DB& db)
