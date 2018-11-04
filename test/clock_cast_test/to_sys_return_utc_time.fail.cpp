@@ -1,6 +1,6 @@
 // The MIT License (MIT)
 //
-// Copyright (c) 2015, 2016 Howard Hinnant
+// Copyright (c) 2017, 2018 Tomasz Kamiński
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -21,17 +21,29 @@
 // SOFTWARE.
 
 #include "tz.h"
-#include <type_traits>
+
+struct bad_clock
+{
+  using duration = std::chrono::system_clock::duration;
+  using rep = duration::rep;
+  using period = duration::period;
+  using time_point = std::chrono::time_point<bad_clock, duration>;
+
+  template<typename Duration>
+  static
+  date::utc_time<Duration>
+  to_sys(std::chrono::time_point<bad_clock, Duration> const& tp)
+  {
+    return date::utc_time<Duration>(tp.time_since_epoch());
+  }
+};
 
 int
 main()
 {
-    using namespace std;
     using namespace date;
-    static_assert( is_nothrow_destructible<time_zone>{}, "");
-    static_assert(!is_default_constructible<time_zone>{}, "");
-    static_assert(!is_copy_constructible<time_zone>{}, "");
-    static_assert(!is_copy_assignable<time_zone>{}, "");
-    static_assert( is_nothrow_move_constructible<time_zone>{}, "");
-    static_assert( is_nothrow_move_assignable<time_zone>{}, "");
+    using sys_clock = std::chrono::system_clock;
+
+    auto bt = bad_clock::time_point();
+    clock_cast<sys_clock>(bt);
 }
